@@ -1,0 +1,268 @@
+# The whole Lightsmith platform on one machine: Community, Studio, Cloud (API + workers) and
+# Materials, on one shared Postgres, Redis and SeaweedFS (S3).
+#
+#   uv run --no-project python scripts/prepare.py   # library wheel + .env with fresh secrets
+#   docker compose up -d --build --wait              # CPU worker; add --profile gpu for the CUDA worker
+#   docker compose --profile import run --rm materials-import   # load refractiveindex.info (once)
+#   docker compose down                              # keep data; `down -v` deletes it
+#
+# Each product is built from its sibling checkout under REPOS_DIR (default: the parent folder).
+# Host ports are published on BIND_ADDRESS (default 127.0.0.1) only.
+name: lightsmith
+
+x-cloud: &cloud
+  image: lightsmith-deploy-cloud-api
+  build:
+    context: ${REPOS_DIR:-..}/lightsmith-cloud
+    dockerfile: docker/api.Dockerfile
+    args: { LIBRARY_SPEC: "wheels/${LIBRARY_WHEEL:?run scripts/prepare.py first}" }
+  environment: &cloud-env
+    LIGHTSMITH_MODE: hosted
+    DATABASE_URL: postgresql+psycopg://cloud:${CLOUD_DB_PASSWORD:?run scripts/prepare.py first}@postgres:5432/cloud
+    REDIS_URL: redis://redis:6379/0
+    LIGHTSMITH_API_KEY_PEPPER: ${CLOUD_API_KEY_PEPPER:?}
+    LIGHTSMITH_ADMIN_TOKEN: ${CLOUD_ADMIN_TOKEN:?}
+    PLATFORM_JWT_SECRET: ${PLATFORM_JWT_SECRET:?}
+    LIGHTSMITH_JWT_AUDIENCE: compute
+    LIGHTSMITH_JWT_ISSUER: lightsmith-community
+    LIGHTSMITH_PUBLIC_WEB_URL: ${COMMUNITY_URL:-http://localhost:3000}
+    LIGHTSMITH_CORS_ORIGINS: ${COMMUNITY_URL:-http://localhost:3000},${STUDIO_URL:-http://localhost:8080}
+    LIGHTSMITH_GPU_TIERS: ${GPU_TIERS:-gpu-12g:12:1.0,gpu-24g:24:1.0,gpu-80g:80:3.0}
+    LIGHTSMITH_S3_BUCKET: lightsmith-results
+    LIGHTSMITH_S3_ENDPOINT_URL: http://s3:8333
+    LIGHTSMITH_S3_CREATE_BUCKET: "true"
+    AWS_ACCESS_KEY_ID: cloud
+    AWS_SECRET_ACCESS_KEY: ${CLOUD_S3_SECRET:?}
+    AWS_DEFAULT_REGION: us-east-1
+    STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+    STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+  volumes: [cloud-data:/data]
+  restart: unless-stopped
+
+x-cloud-after-migrate: &cloud-after-migrate
+  cloud-migrate: { condition: service_completed_successfully }
+  redis: { condition: service_healthy }
+  s3: { condition: service_healthy }
+
+x-community: &community
+  environment: &community-env
+    DATABASE_URL: postgresql://community:${COMMUNITY_DB_PASSWORD:?}@postgres:5432/community
+    S3_ENDPOINT: http://s3:8333
+    S3_REGION: us-east-1
+    S3_BUCKET: lightsmith-community
+    S3_ACCESS_KEY_ID: community
+    S3_SECRET_ACCESS_KEY: ${COMMUNITY_S3_SECRET:?}
+    S3_FORCE_PATH_STYLE: "true"
+    S3_CREATE_BUCKET: "true"
+
+x-materials: &materials
+  image: lightsmith-deploy-materials
+  build:
+    context: ${REPOS_DIR:-..}/lightsmith-materials
+    additional_contexts: { wheels: ./wheels }
+    args: { LIBRARY_SPEC: "/wheels/${LIBRARY_WHEEL:?}" }
+  environment:
+    DATABASE_URL: postgresql+psycopg://materials:${MATERIALS_DB_PASSWORD:?}@postgres:5432/materials
+    PLATFORM_JWT_SECRET: ${PLATFORM_JWT_SECRET:?}
+    PLATFORM_JWT_AUDIENCE: materials-db
+    PLATFORM_JWT_ISSUER: lightsmith-community
+    PUBLIC_BASE_URL: ${MATERIALS_URL:-http://localhost:8100}
+    CORS_ORIGINS: ${COMMUNITY_URL:-http://localhost:3000},${STUDIO_URL:-http://localhost:8080}
+    CROSSREF_ENABLED: ${CROSSREF_ENABLED:-true}
+    CROSSREF_MAILTO: ${CROSSREF_MAILTO:-}
+    RII_COMMIT: ${RII_COMMIT:-c5c2f188e848453def5970e347399d653df2ffc2}
+  read_only: true
+  tmpfs: [/tmp]
+  volumes: [materials-data:/data]
+
+services:
+  # ---- shared infrastructure -------------------------------------------------------------
+
+  postgres:
+    # One server, one database and role per product (created by docker/postgres/10-databases.sh).
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run scripts/prepare.py first}
+      COMMUNITY_DB_PASSWORD: ${COMMUNITY_DB_PASSWORD:?}
+      CLOUD_DB_PASSWORD: ${CLOUD_DB_PASSWORD:?}
+      MATERIALS_DB_PASSWORD: ${MATERIALS_DB_PASSWORD:?}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/10-databases.sh:/docker-entrypoint-initdb.d/10-databases.sh:ro
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-55432}:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d materials"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redisdata:/data]
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 5s, retries: 30 }
+    restart: unless-stopped
+
+  s3:
+    # SeaweedFS S3 gateway with one identity per product, each limited to its own bucket.
+    # The identities file is written from the environment at start-up, so secrets stay in .env.
+    image: chrislusf/seaweedfs:3.97
+    entrypoint: ["/bin/sh", "/s3-start.sh"]
+    environment:
+      COMMUNITY_S3_SECRET: ${COMMUNITY_S3_SECRET:?}
+      CLOUD_S3_SECRET: ${CLOUD_S3_SECRET:?}
+    volumes:
+      - s3data:/data
+      - ./docker/s3/s3-start.sh:/s3-start.sh:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8333/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  mailpit:
+    # Catches Community's sign-in emails. Replace EMAIL_SERVER with a real SMTP server in production.
+    image: axllent/mailpit:v1.27.7
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:${MAILPIT_UI_PORT:-58025}:8025"]
+    healthcheck: { test: ["CMD", "/mailpit", "readyz"], interval: 5s, timeout: 3s, retries: 20 }
+    restart: unless-stopped
+
+  # ---- Lightsmith Community ---------------------------------------------------------------
+
+  community-migrate:
+    <<: *community
+    build: { context: "${REPOS_DIR:-..}/lightsmith-community", target: migrate }
+    image: lightsmith-deploy-community-migrate
+    depends_on: { postgres: { condition: service_healthy } }
+    restart: "no"
+
+  community:
+    <<: *community
+    build: { context: "${REPOS_DIR:-..}/lightsmith-community", target: runner }
+    image: lightsmith-deploy-community
+    environment:
+      <<: *community-env
+      SITE_URL: ${COMMUNITY_URL:-http://localhost:3000}
+      AUTH_URL: ${COMMUNITY_URL:-http://localhost:3000}
+      AUTH_SECRET: ${COMMUNITY_AUTH_SECRET:?}
+      AUTH_TRUST_HOST: "true"
+      AUTH_GITHUB_ID: ${AUTH_GITHUB_ID:-}
+      AUTH_GITHUB_SECRET: ${AUTH_GITHUB_SECRET:-}
+      EMAIL_SERVER: ${EMAIL_SERVER:-smtp://mailpit:1025}
+      EMAIL_FROM: ${EMAIL_FROM:-Lightsmith Community <no-reply@lightsmith.test>}
+      ADMIN_EMAILS: ${ADMIN_EMAILS:-}
+      PLATFORM_JWT_SECRET: ${PLATFORM_JWT_SECRET:?}
+      PLATFORM_JWT_ISSUER: lightsmith-community
+      MATERIALS_API_URL: http://materials:8100
+      COMPUTE_API_URL: http://cloud-api:8200
+      COMPUTE_WS_URL: ${CLOUD_WS_URL:-ws://localhost:8200}
+      STUDIO_URL: ${STUDIO_URL:-http://localhost:8080}
+      GITHUB_REPO_URL: ${GITHUB_REPO_URL:-}
+      PAPER_URL: ${PAPER_URL:-}
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:${COMMUNITY_PORT:-3000}:3000"]
+    depends_on:
+      community-migrate: { condition: service_completed_successfully }
+      s3: { condition: service_healthy }
+      mailpit: { condition: service_healthy }
+      materials: { condition: service_healthy }
+      cloud-api: { condition: service_healthy }
+    restart: unless-stopped
+
+  community-seed:
+    # Demo users, projects and threads. Wipes Community's tables first.
+    <<: *community
+    profiles: ["seed"]
+    build: { context: "${REPOS_DIR:-..}/lightsmith-community", target: seed }
+    image: lightsmith-deploy-community-seed
+    depends_on:
+      community-migrate: { condition: service_completed_successfully }
+      s3: { condition: service_healthy }
+    restart: "no"
+
+  # ---- Lightsmith Studio ------------------------------------------------------------------
+
+  studio:
+    build: { context: "${REPOS_DIR:-..}/lightsmith-studio" }
+    image: lightsmith-deploy-studio
+    environment:
+      STUDIO_COMPUTE_URL: ${CLOUD_URL:-http://localhost:8200}
+      STUDIO_MATERIALS_URL: ${MATERIALS_URL:-http://localhost:8100}
+      STUDIO_COMMUNITY_URL: ${COMMUNITY_URL:-http://localhost:3000}
+      STUDIO_FRAME_ANCESTORS: "'self' ${COMMUNITY_URL:-http://localhost:3000}"
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:${STUDIO_PORT:-8080}:8080"]
+    restart: unless-stopped
+
+  # ---- Lightsmith Cloud -------------------------------------------------------------------
+
+  cloud-migrate:
+    <<: *cloud
+    command: ["lightsmith-server", "migrate"]
+    depends_on: { postgres: { condition: service_healthy } }
+    restart: "no"
+
+  cloud-api:
+    <<: *cloud
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:${CLOUD_PORT:-8200}:8200"]
+    depends_on: *cloud-after-migrate
+
+  cloud-worker:
+    # Runs solvers on CPU. Without the GPU worker it serves every tier; with it, set
+    # CPU_WORKER_QUEUES to the tiers the GPU cannot hold (e.g. gpu-24g,gpu-80g).
+    <<: *cloud
+    command: ["lightsmith-worker"]
+    environment:
+      <<: *cloud-env
+      LIGHTSMITH_WORKER_GPU_MEMORY_BYTES: "0"
+      LIGHTSMITH_WORKER_QUEUES: ${CPU_WORKER_QUEUES:-gpu-12g,gpu-24g,gpu-80g}
+    healthcheck: { test: ["CMD", "lightsmith-worker", "healthcheck"], interval: 30s, timeout: 10s, retries: 3 }
+    depends_on: *cloud-after-migrate
+
+  cloud-worker-gpu:
+    # One NVIDIA GPU (Docker Desktop with WSL2, or the NVIDIA Container Toolkit). Serves the tiers
+    # that fit in its memory. Add one service per extra GPU with device_ids: ["1"], ["2"], ...
+    <<: *cloud
+    profiles: ["gpu"]
+    image: lightsmith-deploy-cloud-worker
+    build:
+      context: ${REPOS_DIR:-..}/lightsmith-cloud
+      dockerfile: docker/worker.Dockerfile
+      args: { LIBRARY_SPEC: "wheels/${LIBRARY_WHEEL:?}" }
+    deploy:
+      resources:
+        reservations:
+          devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }]
+    depends_on: *cloud-after-migrate
+
+  # ---- Lightsmith Materials ---------------------------------------------------------------
+
+  materials-migrate:
+    <<: *materials
+    command: ["materials-db", "migrate"]
+    depends_on: { postgres: { condition: service_healthy } }
+    restart: "no"
+
+  materials:
+    <<: *materials
+    command: ["materials-db", "serve"]
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:${MATERIALS_PORT:-8100}:8100"]
+    depends_on:
+      materials-migrate: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  materials-import:
+    # Loads the pinned refractiveindex.info snapshot; idempotent.
+    <<: *materials
+    profiles: ["import"]
+    command: ["materials-db", "import-rii", "--if-needed", "--crossref"]
+    depends_on:
+      materials-migrate: { condition: service_completed_successfully }
+    restart: "no"
+
+volumes:
+  pgdata:
+  redisdata:
+  s3data:
+  cloud-data:
+  materials-data:
