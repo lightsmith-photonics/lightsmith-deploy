@@ -7,7 +7,7 @@
 
     uv run --no-project python scripts/prepare.py [--library PATH]
 
-The library is found at --library, $LIBRARY_DIR, <REPOS_DIR>/lightsmith or <REPOS_DIR>/PlasmonHub.
+The library is found at --library, $LIBRARY_DIR or <REPOS_DIR>/lightsmith.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def read_env(path: Path) -> dict[str, str]:
 
 def find_library(repos: Path, explicit: str | None) -> Path:
     candidates = [Path(p) for p in (explicit, os.environ.get("LIBRARY_DIR")) if p]
-    candidates += [repos / "lightsmith", repos / "PlasmonHub"]
+    candidates += [repos / "lightsmith"]
     for c in candidates:
         if (c / "pyproject.toml").is_file() and (c / "src" / "lightsmith").is_dir():
             return c.resolve()

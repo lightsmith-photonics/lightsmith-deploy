@@ -29,7 +29,7 @@ browser ── Community :3000 ──┬── Cloud API :8200 ── Redis ─�
 - The sibling checkouts next to this one (or set `REPOS_DIR` in `.env`):
 
   ```
-  lightsmith/ (or PlasmonHub/)   lightsmith-community/   lightsmith-studio/
+  lightsmith/               lightsmith-community/   lightsmith-studio/
   lightsmith-cloud/              lightsmith-materials/   lightsmith-deploy/
   ```
 
